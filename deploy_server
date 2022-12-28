@@ -1,0 +1,416 @@
+#!/bin/sh
+
+self="$(\curl -sS https://gitlab.com/zw963/deployment_bash/-/raw/v0.8.1/deploy_start.sh)" && eval "$self"
+
+export target=$1
+export use_xtls="$use_xtls"
+
+if [ "$use_xtls" ]; then
+    export service_name=xray
+    export another_service_name=v2ray
+else
+    export service_name=v2ray
+    export another_service_name=xray
+fi
+
+function postinstall () {
+    set -u
+    echo
+    echo 'Please wait copy generated client config into local machine ...'
+    scp $target:/etc/${service_name}/v2ray.json ./router/opt/etc/
+    echo "Run [0m[33m./deploy_router admin@192.168.50.1[0m to deploy to router."
+    echo "Run [0m[33m./deploy_side_router root@side_router_ip[0m to deploy to side_router."
+}
+
+# if grep -qs -e 'change_yours_password_here' ${service_name}_server.json; then
+#     echo "$service_name served as a shadowsocks server too."
+#     echo "You must change \`[0m[33mchange_yours_password_here[0m' to a NEW password in \`./${service_name}_server.json'!"
+#     exit
+# fi
+
+# password=$(cat ${service_name}_server.json |grep '"password"' |cut -d':' -f2 |cut -d'"' -f2)
+# sed -i "s#change_yours_password_here#${password}#" "${another_service_name}_server.json"
+
+if [ "$use_xtls" ] && grep -qs -e 'set_your_domain_name_here' ${service_name}_server.json; then
+    echo "You must change \`[0m[33mset_your_domain_name_here[0m' in \`./xray_server.json' to a domain name which point to this host!"
+    echo "e.g. if your's domain name is: \`a.example.com', please set to \`example.com'."
+    exit
+fi
+
+copy xray_server.json /etc/xray/config.json
+copy v2ray_server.json /etc/v2ray/config.json
+copy predownloaded_binary/xray/xray.service /etc/systemd/system/xray.service
+copy predownloaded_binary/xray/xray@.service /etc/systemd/system/xray@.service
+
+deploy_start
+
+set -eu
+
+# --------------------------------------------------------------------------------
+#
+# Following script will be run on remote VPS, please change it to meet your's need.
+#
+# -------------------------------------------------------------------------------
+
+# wget https://install.direct/go.sh
+# bash go.sh
+
+if [ -f /etc/systemd/system/$service_name.service ]; then
+    set +e
+    systemctl stop $service_name
+    systemctl stop $another_service_name
+    systemctl disable $another_service_name
+    systemctl daemon-reload
+    set -e
+fi
+
+xray_version=1.6.0
+v2ray_version=4.44.0
+arch=linux-64
+
+set -e
+
+download_and_extract https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-${arch}.zip Xray-v${xray_version}
+cd Xray-v${xray_version} && chmod +x xray
+
+if ! ./xray --version &>/dev/null; then
+    echo 'Not valid $service_name version is supported for current server, please check if download correct version.'
+    exit
+fi
+
+cp xray /usr/local/bin
+
+download_and_extract https://github.com/v2fly/v2ray-core/releases/download/v${v2ray_version}/v2ray-${arch}.zip v2ray-v${v2ray_version}
+cd v2ray-v${v2ray_version} &&
+    chmod +x v2ctl v2ray &&
+    cp v2ray v2ctl *.dat /usr/local/bin &&
+    cp systemd/system/*.service /etc/systemd/system
+
+replace_regex 'RestartPreventExitStatus=23' 'RestartPreventExitStatus=23
+# Added by user
+LimitNPROC=500
+LimitNOFILE=1000000' /etc/systemd/system/v2ray.service
+replace_regex 'RestartPreventExitStatus=23' 'RestartPreventExitStatus=23
+# Added by user
+LimitNPROC=500
+LimitNOFILE=1000000' /etc/systemd/system/v2ray@.service
+replace_regex '/usr/local/etc/v2ray/config.json' '/etc/v2ray/config.json' /etc/systemd/system/v2ray.service
+replace_regex '/usr/local/etc/v2ray/%i.json' '/etc/v2ray/%i.json' /etc/systemd/system/v2ray@.service
+
+mkdir -p /var/log/xray /var/log/v2ray
+chown nobody:nobody /var/log/xray /var/log/v2ray
+
+uuid=$(cat /proc/sys/kernel/random/uuid)
+# quic_key=$(uuidgen | sed 's/[-]//g' | head -c 20)
+
+replace_string 'NEWUUID' "${uuid}" /etc/xray/config.json
+replace_string 'NEWUUID' "${uuid}" /etc/v2ray/config.json
+# replace_string 'QUIC_KEY' "${quic_key}" /etc/xray/config.json
+
+ss_password=$(openssl rand -base64 32)
+
+replace_string 'SSPASS' "${ss_password}" /etc/xray/config.json
+replace_string 'SSPASS' "${ss_password}" /etc/v2ray/config.json
+
+config_sysctl_for_proxy
+
+systemctl enable $service_name
+
+if [ "$use_xtls" ]; then
+    domain_name=$(cat /etc/xray/config.json |grep certificateFile | sed 's#.*/etc/ssl/\(.*\)/fullchain.pem.*#\1#g')
+    # 默认不再部署 tls, 因为更新 xray 的时候不一定要更新证书
+    # deploy_tls "$domain_name" "systemctl restart $service_name"
+else
+    domain_name="localhost"
+fi
+
+systemctl restart $service_name
+systemctl status $service_name
+systemctl enable $service_name
+
+# 从 server config.json 来获取必须的一些信息.
+v2ray_port=$(cat /etc/$service_name/config.json |grep '"inbounds"' -A10 |grep '"protocol" *: *"\(vmess\|vless\)"' -A3 |grep '"port"' |grep -o '[0-9]*')
+ss_port=$(cat /etc/$service_name/config.json |grep '"inbounds"' -A100 |grep '"protocol" *: *"shadowsocks"' -A3 |grep '"port"' |grep -o '[0-9]*')
+ss_encrypt_method=$(cat /etc/$service_name/config.json |grep '"inbounds"' -A100 |grep '"protocol" *: *"shadowsocks"' -A10 |grep '"method"'|cut -d':' -f2|cut -d'"' -f2)
+# ss_password=$(cat /etc/$service_name/config.json |grep '"inbounds"' -A100 |grep '"protocol" *: *"shadowsocks"' -A10 |grep '"password"'|cut -d':' -f2|cut -d'"' -f2)
+
+expose_port $v2ray_port
+expose_port $ss_port
+
+set -u
+cat <<HEREDOC > /etc/$service_name/v2ray.json
+// 本脚本当运行 deploy_server 时自动生成。
+// 本脚本可作为 普通 v2ray 客户端脚本，也可以作为 ASUS 梅林路由器/旁路由 透明代理脚本，
+// 运行 ./deploy_router admin@router.asus.com 部署这个配置文件到路由器。
+// 运行 ./deploy_side_router root@one_ip 部署这个配置文件到旁路由。
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "dns": {
+        "hosts": {
+            "dns.google": "8.8.4.4",
+            "$domain_name": "$targetip"
+        },
+        "servers": [
+            // V2Ray 会使用 DNS over HTTPS (RFC8484, 简称DOH) 进行查询。
+            // DoH 默认走第一个 outbound 来查询 （DoH 域名需要在 hosts 中指定 IP 地址）
+            "8.8.4.4",
+            {
+                // localhost 代表使用运营商的 DNS.
+                "address": "localhost",
+                "port": 53,
+                "domains": [
+                    "geosite:cn"
+                ],
+                "expectIPs": [
+                    "ext:geoip-only-cn-private.dat:cn"
+                ]
+            },
+            {
+                // fakeDNS 必须，否则会被解析为 fake IP.
+                // 注意，某些视频网站视频无法播放，貌似就是因为访问网站时，
+                // 解析到错误的 IP 地址。
+                "address": "localhost",
+                "port": 53,
+                "domains": [
+                    "router.asus.com",
+                    "arch.pool.ntp.org",
+                    "dl.google.com",
+                    "douyin.com"
+                ]
+            }
+        ],
+        // 默认为 false, 开启后，如果通过默认的 DNS 访问返回结果不匹配 cn site/ip,
+        // 将使用 servers 里面的第一个，8.8.4.4 访问。
+        "disableFallback": true
+    },
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "domainMatcher": "mph",
+        "rules": [
+            {
+                // tproxy 透明代理必需。
+                "type": "field",
+                "inboundTag": ["transparent"],
+                "port": 53,
+                "network": "udp",
+                "outboundTag": "dns-outbound"
+            },
+            {
+                // redirect 透明代理必需。
+                "type": "field",
+                "inboundTag": ["dns-inbound"],
+                "outboundTag": "dns-outbound"
+            },
+            {
+                "type": "field",
+                "ip": ["8.8.4.4"],
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "ip": [
+                    "ext:geoip-only-cn-private.dat:cn",
+                    "ext:geoip-only-cn-private.dat:private"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    // 这里添加域名白名单.
+                    "geosite:cn",
+                    "router.asus.com",
+                    "arch.pool.ntp.org",
+                    "dl.google.com",
+                    "sourceforge.net",
+                    "douyin.com"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    // 这里添加必须走 proxy 的域名例外.
+                    "services.googleapis.cn"
+                ],
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:category-ads"
+                ],
+                "outboundTag": "block"
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "tag": "transparent",
+            "protocol": "dokodemo-door",
+            "port": 1081, // 透明代理 1081 端口
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            },
+            "settings": {
+                "network": "tcp,udp",
+                // 当值为 true 时，dokodemo-door 会识别出由 iptables 转发而来的数据，并转发到相应的目标地址。详见 传输配置 中的 tproxy 设置。
+                "followRedirect": true
+            },
+            "streamSettings": {
+                "sockopt": {
+                    // 当 Dokodemo-door 中指定了 followRedirect，且 sockopt.tproxy 为空时，
+                    // sockopt.tproxy 的值会被设为 "redirect"，因此该设定 redirect 模式非必须的。
+                    // 下面的选项会在 patch_router 的时候，自动选择 tproxy/redirect, 并被替换。
+                    "tproxy": "tproxy",
+                    "mark": 255
+                }
+            }
+        },
+        {
+            // redirect 透明代理必需(不支持tproxy时), 用来接受从 dnsmasq 转发过来的 DNS 流量。
+            "tag": "dns-inbound",
+            "protocol": "dokodemo-door",
+            "port": 65053, // 当使用 redirect 模式时, 在 65053 端口监听来自于 dnsmasq 的 udp 流量.
+            "settings": {
+                // 这里是流量被转发到的地址，端口，可接受的网络协议类型
+                // 注意： 这有别于 dns-outbound 中对应的配置，后者是直接修改 DNS 服务器地址/端口
+                // 因为这里的流量直接来自 dnsmasq, 所以这个 address 必须填, 似乎随便填都可以.
+                "address": "8.8.4.4",
+                "port": 53,
+                "network": "udp"
+            }
+        },
+        {
+            "protocol": "socks", // 入口协议为 SOCKS 5
+            "port": 1080, // 监听端口
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            },
+            "settings": {
+                "auth": "noauth"  //socks的认证设置，noauth 代表不认证，由于 socks 通常在客户端使用，所以这里不认证
+            }
+        },
+        {
+            "protocol": "http",
+            "port": 3128,
+            "settings": {
+                "timeout": 0
+            }
+        }
+    ],
+    "outbounds": [
+        // 下面两个顺序不可以颠倒, 因为列表中的第一个元素作为主出站协议, 当路由匹配不存在或没有匹配成功时，
+        // 流量由主出站协议发出, 我们要确保主出站协议必须是 proxy.
+        {
+            "tag": "proxy",
+            "protocol": "vless", // 出口协议
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "$targetip", // 服务器地址，请修改为你自己的服务器 IP 或域名
+                        "port": $v2ray_port,  // 服务器端口
+                        "users": [
+                            {
+                                // 注意, vmess 加密默认开启, 也必须开启, 否则上不了网.
+                                // vless 则关闭加密，必须设定 encryption 为 none.
+                                // alterId 默认为 0, 表示开启 VMessAEAD.
+                                "encryption": "none",
+                                "flow": "xtls-rprx-splice",
+                                "id": "$uuid"  // 用户 ID，必须与服务器端配置相同
+                            }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+               "network": "tcp",
+               "security": "xtls", // 需要使用 XTLS
+                "xtlsSettings": {
+                    "serverName": "$domain_name" // 换成你的域名
+                },
+                "sockopt": {
+                    "mark": 255
+                }
+            }
+        },
+        {
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [
+                    {
+                        "address": "$targetip", // Shadowsocks 的服务器地址
+                        "method": "$ss_encrypt_method", // Shadowsocks 的加密方式
+                        "password": "$ss_password", // Shadowsocks 的密码
+                        "port": $ss_port
+                    }
+                ]
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "mark": 255
+                }
+            }
+        },
+        {
+            // 识别这是一个 DNS 请求， 并发送到内部 DNS 进行查询.
+            "tag": "dns-outbound",
+            "protocol": "dns",
+            "streamSettings": {
+                "sockopt": {
+                    "mark": 255
+                }
+            }
+        },
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {
+                // 这里我选择加上试试, 搞不好我的方案, freedom 真的又去访问 dnsmasq
+                // 的 53 端口, 又被转到 V2ray 的 DNS 呢.
+                "domainStrategy": "UseIP"
+            },
+            "streamSettings": {
+                "network": "tcp",  // 这是默认值
+                "sockopt": {
+                    "mark": 255
+                }
+            }
+        },
+        {
+            "tag": "block",
+            "protocol": "blackhole",
+            "settings": {
+                "response": {
+                    "type": "http"
+                }
+            }
+        }
+    ],
+    "policy": {
+        "levels": {
+            "0": {
+                "bufferSize": 4
+            }
+        }
+    }
+}
+HEREDOC
+
+if [ -z "$use_xtls" ]; then
+    replace_string '"protocol": "vless",' '"protocol": "vmess",' /etc/$service_name/v2ray.json
+    replace_multiline1 '"encryption": "none",\s*"flow": "xtls-rprx-.*?",' '' /etc/$service_name/v2ray.json
+    replace_multiline1 '"network": "tcp",\s*"security": "xtls".*?},' '"network": "quic",
+               "quicSettings": {
+                    "header": {
+                        "type": "wechat-video"
+                    }
+                },' /etc/$service_name/v2ray.json
+fi
+
+echo 'Congratulations, Deploy succssful!'
+echo 'Please check generated client config file at router/opt/etc/v2ray.json'

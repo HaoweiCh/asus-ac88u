@@ -1,0 +1,165 @@
+#!/bin/bash
+
+self="$(\curl -sS https://gitlab.com/zw963/deployment_bash/-/raw/v0.8.3/deploy_start.sh)" && eval "$self"
+
+export target=$1
+
+config=./router/opt/etc/v2ray.json
+
+if [ ! -e "$config" ];then
+    echo "Please create ${config} or generate it use ./deploy_server before deploy to router."
+    exit
+fi
+
+function postinstall () {
+    set -u
+    echo
+    echo 'Please waiting for 10 seconds to check google available ...'
+    sleep 10
+    check_google=$(curl -so /dev/null -w 'Google: %{http_code}\n' google.com)
+    if [[ "$check_google" =~ 301|200 ]]; then
+        echo "visit google successful, Your's ip is: $(curl http://ipecho.net/plain; echo)"
+    else
+        echo 'visit google failed, something was wrong!'
+    fi
+}
+copy "$config" /opt/etc/
+copy router/opt/etc/apply_iptables_rule.sh /opt/etc/
+copy router/opt/etc/clean_iptables_rule.sh /opt/etc
+copy router/opt/etc/enable_swap.sh /opt/etc
+copy router/opt/etc/update_geosite.sh /opt/etc
+copy router/opt/etc/update_big_geosite.sh /opt/etc
+copy router/opt/etc/restart_dnsmasq.sh /opt/etc
+copy router/opt/etc/toggle_proxy.sh /opt/etc
+copy router/opt/etc/patch_router /opt/etc
+copy router/opt/etc/check_google_use_proxy.sh /opt/etc
+copy router/opt/etc/check_google_use_socks5.sh /opt/etc
+copy router/opt/etc/debug_v2ray.sh /opt/etc
+
+if [ -d predownloaded_binary ]; then
+    echo 'Copy predownloaded binary to router ...'
+    v2ray_zip_file=$(ls -1 predownloaded_binary/v2ray-linux-arm*.zip |head -n1)
+    copy $v2ray_zip_file $v2ray_zip_file
+    xray_zip_file=$(ls -1 predownloaded_binary/Xray-linux-arm*.zip |head -n1)
+    copy $xray_zip_file $xray_zip_file
+else
+    ssh "$*" "rm -rf predownloaded_binary"
+    echo 'Please download predownloaded binary into predownloaded_binary folder.'
+    exit 1
+fi
+
+deploy_start
+
+set -eu
+
+# --------------------------------------------------------------------------------
+#
+# Following script will be run on router, please change it to meet your's need.
+#
+# -------------------------------------------------------------------------------
+
+#
+# 如果第一次运行本脚本, 请务必初始化 entware 包管理系统.
+# ssh 登陆路由器, 执行 entware-setup.sh, 选择 1'
+
+if ! opkg --version; then
+    echo "Run \`opkg --version' failed."
+    echo 'Please initialise entware-ng first if you run this script the first time.'
+    echo "e.g. plugin your's usb disk, and run \`entware-setup.sh', select 1."
+    echo "Or run \`amtm' to initialize entware if you use a newer merlin firmware."
+    exit
+fi
+
+if [ ! -e /jffs/scripts/services-start ]; then
+    cat <<'HEREDOC' > /jffs/scripts/services-start
+#!/bin/sh
+
+RC='/opt/etc/init.d/rc.unslung'
+
+i=30
+until [ -x "$RC" ] ; do
+  i=$(($i-1))
+  if [ "$i" -lt 1 ] ; then
+    logger "Could not start Entware"
+    exit
+  fi
+  sleep 1
+done
+$RC start
+HEREDOC
+fi
+
+cd predownloaded_binary && unzip -o v2ray-linux-arm*.zip && chmod +x v2ctl v2ray
+
+if ./v2ray -version; then
+    set +e
+    chmod -x /opt/etc/init.d/S22v2ray && sh /opt/etc/init.d/S22v2ray stop
+    set -e
+    cp v2ray v2ctl geosite.dat geoip-only-cn-private.dat /opt/sbin/
+else
+    echo 'Not valid v2ray version is supported by current router, please download correct version.'
+    exit
+fi
+
+cat <<'HEREDOC' > /opt/etc/init.d/S22v2ray
+#!/bin/sh
+
+ENABLED=yes
+PROCS=v2ray
+ARGS="-config /opt/etc/v2ray.json"
+PREARGS=""
+DESC=$PROCS
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[ -z "$(which $PROCS)" ] && exit 0
+
+. /opt/etc/init.d/rc.func
+HEREDOC
+
+echo 'v2ray was installed.'
+
+# ----------------------------------------------------
+#
+# 下面执行一些脚本检查与替换。
+#
+# ---------------------------------------------------
+
+cd /opt/etc
+chmod +x apply_iptables_rule.sh \
+      clean_iptables_rule.sh \
+      enable_swap.sh \
+      update_geosite.sh \
+      update_big_geosite.sh \
+      restart_dnsmasq.sh \
+      toggle_proxy.sh \
+      patch_router \
+      /jffs/scripts/services-start \
+      check_google_use_proxy.sh \
+      check_google_use_socks5.sh \
+      debug_v2ray.sh
+
+# ----------------------------------------------------
+#
+# 启动所需的脚本
+#
+# ---------------------------------------------------
+
+# 每隔 3 分钟检测下所有的服务是否运行, 以及 iptables rule 是否失效.
+add_service wan-start 'cru a run-services "*/3 * * * * /jffs/scripts/services-start"'
+add_service wan-start 'cru a run-iptables "*/3 * * * * /opt/etc/apply_iptables_rule.sh"'
+# 每个周日的 5: 25 升级一次 geosites 数据.
+add_service wan-start 'cru a update_geosites "25 5 * * 0 /opt/etc/update_geosite.sh"'
+/jffs/scripts/wan-start
+
+# Because newest asus merlin introduce AMTM, please enable swap file there if need it.
+# 打开swap
+# echo 'Enabling swap'
+# /opt/etc/enable_swap.sh
+# add_service post-mount '/opt/etc/enable_swap.sh'
+
+# 如果 DHCP 重新分配 IP 地址时, 会清除 iptables rule, 此时重新应用 iptables
+add_service dhcpc-event '/opt/etc/apply_iptables_rule.sh'
+
+add_service services-start '[ -f /tmp/patch_router_was_run_at ] || /opt/etc/patch_router'
+
+/opt/etc/patch_router && echo "Congratulations, [0m[33mDeploy succssful[0m!"
