@@ -1,6 +1,6 @@
 #!/bin/bash
 
-self="$(\curl -sS https://gitlab.com/zw963/deployment_bash/-/raw/v0.8.3/deploy_start.sh)" && eval "$self"
+#self="$(\curl -sS https://gitlab.com/zw963/deployment_bash/-/raw/v0.8.3/deploy_start.sh)" && eval "$self"
 
 export target=$1
 
@@ -26,7 +26,7 @@ function postinstall () {
 copy "$config" /opt/etc/
 copy router/opt/etc/apply_iptables_rule.sh /opt/etc/
 copy router/opt/etc/clean_iptables_rule.sh /opt/etc
-copy router/opt/etc/enable_swap.sh /opt/etc
+#copy router/opt/etc/enable_swap.sh /opt/etc
 copy router/opt/etc/update_geosite.sh /opt/etc
 copy router/opt/etc/update_big_geosite.sh /opt/etc
 copy router/opt/etc/restart_dnsmasq.sh /opt/etc
@@ -48,13 +48,13 @@ else
     exit 1
 fi
 
-deploy_start
+deploy_start # 仅仅是检查 $1 目标测试是否正确
 
 set -eu
 
 # --------------------------------------------------------------------------------
 #
-# Following script will be run on router, please change it to meet your's need.
+# Following script will be run on router, please change it to meet your need.
 #
 # -------------------------------------------------------------------------------
 
@@ -127,13 +127,12 @@ echo 'v2ray was installed.'
 cd /opt/etc
 chmod +x apply_iptables_rule.sh \
       clean_iptables_rule.sh \
-      enable_swap.sh \
       update_geosite.sh \
-      update_big_geosite.sh \
       restart_dnsmasq.sh \
       toggle_proxy.sh \
       patch_router \
       /jffs/scripts/services-start \
+      update_big_geosite.sh \
       check_google_use_proxy.sh \
       check_google_use_socks5.sh \
       debug_v2ray.sh
@@ -151,11 +150,6 @@ add_service wan-start 'cru a run-iptables "*/3 * * * * /opt/etc/apply_iptables_r
 add_service wan-start 'cru a update_geosites "25 5 * * 0 /opt/etc/update_geosite.sh"'
 /jffs/scripts/wan-start
 
-# Because newest asus merlin introduce AMTM, please enable swap file there if need it.
-# 打开swap
-# echo 'Enabling swap'
-# /opt/etc/enable_swap.sh
-# add_service post-mount '/opt/etc/enable_swap.sh'
 
 # 如果 DHCP 重新分配 IP 地址时, 会清除 iptables rule, 此时重新应用 iptables
 add_service dhcpc-event '/opt/etc/apply_iptables_rule.sh'

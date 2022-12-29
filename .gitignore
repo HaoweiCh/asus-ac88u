@@ -1,3 +1,5 @@
-/router/opt/etc/v2ray.json*
 logs/*
-predownloaded_binary/*.zip
+!logs/.gitkeep
+opt-bin/v2ray
+opt-bin/*.dat
+opt-etc/v2ray.json
