@@ -15,9 +15,9 @@ tasks:
     cmds:
       - scp -r opt-bin/* 88u:/opt/bin
       - scp -r opt-usr-bin/* 88u:/opt/usr/bin
-      - scp -r opt-etc/* 88u:/opt/etc
+#      - scp -r opt-etc/* 88u:/opt/etc
       - scp -r opt-etc-init.d/* 88u:/opt/etc/init.d
-      - ssh 88u "/opt/usr/bin/env_check.sh"
+#      - ssh 88u "/opt/usr/bin/env_check.sh"
 
   test:
     cmds:

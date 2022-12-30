@@ -1,5 +1,5 @@
 logs/*
 !logs/.gitkeep
-opt-bin/v2ray
-opt-bin/*.dat
+opt-bin/*
+!opt-bin/.gitkeep
 opt-etc/v2ray.json
